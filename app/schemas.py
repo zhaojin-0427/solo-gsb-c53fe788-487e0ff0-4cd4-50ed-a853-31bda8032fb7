@@ -292,3 +292,144 @@ class AuditResponse(BaseModel):
     )
     replay: list[ReplayedSegment] = Field(default_factory=list)
     violations: list[ExecutionViolation] = Field(default_factory=list)
+
+
+# ======================== POST /spools/allocate ========================
+
+
+class SpoolIn(BaseModel):
+    """一个可用料卷：唯一 ID、材料与当前余量（卸下后余量保留，可复用）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    spool_id: str = Field(..., min_length=1, description="料卷 ID，全局唯一")
+    material_id: str = Field(..., min_length=1, description="料卷材料 ID")
+    remaining_mm3: int = Field(..., ge=0, description="料卷当前余量（mm^3）")
+
+
+class SequenceItem(BaseModel):
+    """固定执行顺序中的一个层段引用。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(..., min_length=1, description="作业 ID")
+    segment_index: int = Field(..., ge=1, description="作业内层段序号，从 1 开始")
+
+
+class SpoolAllocateRequest(PlanRequest):
+    """POST /spools/allocate 的请求体：PlanRequest 全部参数 + 固定顺序 + 料卷。
+
+    基类 :class:`PlanRequest` 的校验（作业、材料、purge 矩阵等）原样生效；
+    本类额外校验：``sequence`` 必须恰好覆盖全部层段、无重复、不引用未知
+    层段，且每个作业的层段按层序出现（漏段 / 重复 / 未知 / 乱序均 422）；
+    ``spools`` 的 ``spool_id`` 必须唯一（空 ID、空材料、负余量由字段
+    约束拦截）。
+    """
+
+    sequence: list[SequenceItem] = Field(
+        ...,
+        description="固定执行顺序：覆盖全部层段且作业内按层序排列（跨作业可交错）",
+    )
+    spools: list[SpoolIn] = Field(
+        ...,
+        description="可用料卷：唯一 spool_id、材料 ID、非负余量",
+    )
+
+    @model_validator(mode="after")
+    def _validate_sequence_and_spools(self) -> "SpoolAllocateRequest":
+        seg_counts = {j.job_id: len(j.segments) for j in self.jobs}
+        seen: set = set()
+        per_job: Dict[str, list] = {}
+        for it in self.sequence:
+            if it.job_id not in seg_counts:
+                raise ValueError(f"sequence 引用了未知作业: {it.job_id}")
+            if it.segment_index > seg_counts[it.job_id]:
+                raise ValueError(
+                    f"sequence 引用了未知层段: 作业 {it.job_id} 只有 "
+                    f"{seg_counts[it.job_id]} 段，却给出第 {it.segment_index} 段"
+                )
+            key = (it.job_id, it.segment_index)
+            if key in seen:
+                raise ValueError(
+                    f"sequence 中层段重复: 作业 {it.job_id} 第 {it.segment_index} 段"
+                )
+            seen.add(key)
+            per_job.setdefault(it.job_id, []).append(it.segment_index)
+        missing = [
+            (j.job_id, k)
+            for j in self.jobs
+            for k in range(1, len(j.segments) + 1)
+            if (j.job_id, k) not in seen
+        ]
+        if missing:
+            job_id, seg_idx = missing[0]
+            raise ValueError(
+                f"sequence 未覆盖全部层段: 缺少作业 {job_id} 第 {seg_idx} 段"
+                f"（共缺 {len(missing)} 段）"
+            )
+        # 覆盖全集后，作业内层段按下标升序 ⟺ 严格按 1..k 层序出现
+        for job_id, idxs in per_job.items():
+            if idxs != sorted(idxs):
+                raise ValueError(
+                    f"sequence 中作业 {job_id} 的层段未按层序排列（乱序）"
+                )
+        spool_ids = [s.spool_id for s in self.spools]
+        if len(set(spool_ids)) != len(spool_ids):
+            raise ValueError("spools 中 spool_id 必须唯一")
+        return self
+
+
+class AllocatedSegment(BaseModel):
+    """逐段分配结果：选卷、扣减与扣后余量（按固定顺序排列）。"""
+
+    order: int = Field(..., description="在固定执行顺序中的序号，从 1 开始")
+    job_id: str
+    segment_index: int = Field(..., description="作业内层段序号，从 1 开始")
+    material_id: str
+    volume_mm3: int = Field(..., description="该段名义打印体积（mm^3）")
+    purge_before_mm3: int = Field(
+        ...,
+        description="段前 purge：与上一段材料不同（首段相对初始材料）时按矩阵计，否则为 0",
+    )
+    spool_id: str = Field(..., description="该段选用的料卷 ID")
+    deduct_mm3: int = Field(
+        ..., description="从该卷扣除的总量（mm^3）= 打印体积 + 段前 purge"
+    )
+    spool_remaining_after_mm3: int = Field(..., description="本段扣除后该卷的余量（mm^3）")
+
+
+class SpoolUsage(BaseModel):
+    """单卷用量汇总。"""
+
+    spool_id: str
+    material_id: str
+    initial_remaining_mm3: int = Field(..., description="请求中给出的初始余量（mm^3）")
+    used_mm3: int = Field(..., description="全流程累计扣减（mm^3）")
+    remaining_mm3: int = Field(..., description="分配结束后的余量（mm^3）")
+
+
+class SpoolAllocateResponse(BaseModel):
+    status: str = Field(
+        ...,
+        description=(
+            "OPTIMAL / FEASIBLE / INSUFFICIENT_STOCK / "
+            "PURGE_CAPACITY_EXCEEDED / UNKNOWN"
+        ),
+    )
+    optimal: bool = Field(
+        ..., description="相邻料卷变化次数与逐段料卷字典序是否均已证最优"
+    )
+    objective: Optional[dict] = Field(
+        None,
+        description="目标值：相邻料卷变化次数，以及变化次数 / 字典序是否已证最优",
+    )
+    allocations: list[AllocatedSegment] = Field(default_factory=list)
+    spools: list[SpoolUsage] = Field(default_factory=list)
+    spool_changes: Optional[int] = Field(
+        None, description="相邻层段料卷 ID 变化次数（无分配时为 null）"
+    )
+    purge_used_mm3: int = 0
+    purge_remaining_mm3: Optional[int] = Field(
+        None, description="总容量 - 顺序 purge 总量；超容时为负值"
+    )
+    solver_message: str = ""

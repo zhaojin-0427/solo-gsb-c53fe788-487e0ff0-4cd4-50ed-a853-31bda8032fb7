@@ -26,6 +26,14 @@
 基准后**逐段按实测时间线回放**——保留空闲与实际耗时，不按紧密排产重算——返回
 进行中 / 完成 / 违规状态、已用与剩余 purge、完工作业逾期与违规位置。
 
+服务还提供 **`POST /spools/allocate`（料卷分配）**：提交相同的规划参数、一个
+**覆盖全部层段且作业内按序的固定执行顺序**，以及可用料卷（唯一料卷 ID、材料、
+非负余量）。服务沿该顺序从初始材料逐段计算 purge，把每段打印体积与换料 purge
+都从所选（目标材料）料卷的余量中扣除（卸下的料卷余量保留、可再次装回复用），
+先**最小化相邻层段料卷 ID 变化次数**、再按**逐段料卷 ID 字典序**决胜，返回
+逐段选卷、扣减与各卷余量；库存不足返回缺料状态、顺序 purge 超容返回超容状态
+（均无分配），漏段、乱序或料卷非法返回 422。
+
 ---
 
 ## 一、Docker Compose 一键启动
@@ -349,6 +357,167 @@ CP-SAT 可能来不及给出任何解，服务改用免求解的构造性候选�
 | `INFEASIBLE` | `false` | 无解，见 `infeasible_reason` |
 | `UNKNOWN` | `false` | 限时内连可行计划都无法给出（构造性候选也不满足容量） |
 
+### `POST /spools/allocate` 料卷分配
+
+提交 `/plans` 的全部规划参数（`PlanRequest`），外加一个**固定执行顺序**和
+**可用料卷列表**，服务为顺序中的每一层段选择一卷同材料料卷并扣减余量：
+
+- **不重新排产、不涉及时间**：执行顺序由请求给定（`sequence`），服务只选卷；
+- 经与 `/plans` 相同的校验和 `build_instance` 取各层段材料与名义体积，
+  **沿固定顺序从 `initial_material` 逐段计算段前 purge**（段材料与上一段
+  不同、或首段与初始材料不同时，按 `purge_matrix[from][to]` 计）；
+- 每段的**打印体积 + 段前 purge 均从该段所选（目标材料）料卷**的余量中
+  扣除；料卷卸下后余量保留，之后可再次装回**复用**；
+- 顺序本身的 purge 总量超过 `total_purge_capacity_mm3` 时直接返回超容状态，
+  不进行分配。
+
+在所有可行分配中，先**最小化相邻层段料卷 ID 变化次数**（少换卷），再按
+**逐段料卷 ID 字典序**决胜。两级目标均用 CP-SAT 精确求解（先证最小变化
+次数，再在该值锁定下逐位固定字典序最小的料卷），因此需要全局搭配的实例
+也能正确分配——例如同材料两段依次需 4、6 mm³，余量为 4、6 的两卷会按
+4→4、6→6 分配，而不会贪心错配后误判缺料。
+
+请求字段（`PlanRequest` 之外的部分；`jobs`、`purge_matrix` 等规则同 `/plans`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `sequence` | 数组 | 固定执行顺序：必须**覆盖全部层段**、无重复，且每个作业的层段按层序出现（跨作业可任意交错）；漏段、重复、引用未知层段、作业内乱序均返回 422 |
+| `sequence[].job_id` | 非空字符串 | 作业 ID，必须在 `jobs` 中存在 |
+| `sequence[].segment_index` | 正整数 | 作业内层段序号，必须在该作业层段范围内 |
+| `spools` | 数组（可为空） | 可用料卷列表 |
+| `spools[].spool_id` | 非空字符串 | 料卷 ID，**全局唯一**（重复返回 422） |
+| `spools[].material_id` | 非空字符串 | 料卷材料 ID |
+| `spools[].remaining_mm3` | 非负整数 | 料卷当前余量（mm³） |
+
+返回状态（响应字段 `status`）：
+
+| `status` | 含义 |
+| --- | --- |
+| `OPTIMAL` | 已找到完整分配，且相邻料卷变化次数与逐段料卷字典序两级目标均已证最优（`optimal=true`） |
+| `FEASIBLE` | 已找到完整分配，但限时内未证明全部目标最优；`objective` 中 `spool_changes_optimal` / `lexicographic_minimal` 如实标记 |
+| `INSUFFICIENT_STOCK` | **缺料**：不存在满足全部层段扣减的料卷分配，`allocations` / `spools` 为空 |
+| `PURGE_CAPACITY_EXCEEDED` | **超容**：固定顺序的 purge 总量超过 `total_purge_capacity_mm3`，未进行分配 |
+| `UNKNOWN` | 限时内无法判定是否存在可行分配 |
+
+响应主要字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `allocations[]` | 逐段分配结果：段前 purge、选卷 `spool_id`、扣减 `deduct_mm3`（= 打印体积 + 段前 purge）、扣后余量 `spool_remaining_after_mm3` |
+| `spools[]` | 各卷用量汇总：初始余量、累计扣减 `used_mm3`、剩余 `remaining_mm3` |
+| `spool_changes` | 相邻层段料卷 ID 变化次数（第一级目标值） |
+| `purge_used_mm3` / `purge_remaining_mm3` | 顺序 purge 总量与容量余量（超容时余量为负值） |
+| `objective` | 目标值与两级目标是否已证最优 |
+
+#### 分配请求示例：选卷与余量
+
+请求体见 `examples/request_spools.json`：两个作业共 4 段，固定顺序
+J1.1(PLA) → J1.2(ABS) → J2.1(ABS) → J2.2(PLA)，4 卷料（PLA 两卷 150/110、
+ABS 两卷 200/120）。启动服务并调用：
+
+```bash
+docker compose up --build -d
+
+curl -X POST http://localhost:8000/spools/allocate \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_spools.json
+```
+
+**响应（与服务实际输出一致）**：
+
+```json
+{
+  "status": "OPTIMAL",
+  "optimal": true,
+  "objective": {
+    "spool_changes": 3,
+    "spool_changes_optimal": true,
+    "lexicographic_minimal": true
+  },
+  "allocations": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "volume_mm3": 100, "purge_before_mm3": 0, "spool_id": "SPLA-1",
+     "deduct_mm3": 100, "spool_remaining_after_mm3": 50},
+    {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "ABS",
+     "volume_mm3": 40, "purge_before_mm3": 120, "spool_id": "SABS-1",
+     "deduct_mm3": 160, "spool_remaining_after_mm3": 40},
+    {"order": 3, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+     "volume_mm3": 120, "purge_before_mm3": 0, "spool_id": "SABS-2",
+     "deduct_mm3": 120, "spool_remaining_after_mm3": 0},
+    {"order": 4, "job_id": "J2", "segment_index": 2, "material_id": "PLA",
+     "volume_mm3": 30, "purge_before_mm3": 80, "spool_id": "SPLA-2",
+     "deduct_mm3": 110, "spool_remaining_after_mm3": 0}
+  ],
+  "spools": [
+    {"spool_id": "SPLA-1", "material_id": "PLA", "initial_remaining_mm3": 150,
+     "used_mm3": 100, "remaining_mm3": 50},
+    {"spool_id": "SPLA-2", "material_id": "PLA", "initial_remaining_mm3": 110,
+     "used_mm3": 110, "remaining_mm3": 0},
+    {"spool_id": "SABS-1", "material_id": "ABS", "initial_remaining_mm3": 200,
+     "used_mm3": 160, "remaining_mm3": 40},
+    {"spool_id": "SABS-2", "material_id": "ABS", "initial_remaining_mm3": 120,
+     "used_mm3": 120, "remaining_mm3": 0}
+  ],
+  "spool_changes": 3,
+  "purge_used_mm3": 200,
+  "purge_remaining_mm3": 200,
+  "solver_message": "已找到完整分配（相邻料卷变化 3 次），变化次数与逐段料卷字典序均已证最优"
+}
+```
+
+结果解读：沿固定顺序，J1.2 前 PLA→ABS purge 120、J2.2 前 ABS→PLA purge 80
+（共 200 mm³，容量 400 内）。ABS 两段连续（J1.2、J2.1）共需 160+120=280 mm³，
+一卷装不下，拆给 SABS-1（160，含 120 purge）与 SABS-2（120，恰好用尽）；
+J2.2 的 110 mm³（30 打印 + 80 purge）SPLA-1 余量 50 不够，改用 SPLA-2 恰好
+用尽。相邻换卷 3 次（PLA→ABS 换料、ABS 段内换卷、ABS→PLA 换料），前两次
+换料由材料决定不可避免，段内换卷由容量决定不可避免，故已证最优。
+
+#### 缺料响应（INSUFFICIENT_STOCK）
+
+把 ABS 库存减到 200 mm³（需求 280）：
+
+```json
+{
+  "status": "INSUFFICIENT_STOCK",
+  "optimal": false,
+  "objective": null,
+  "allocations": [],
+  "spools": [],
+  "spool_changes": null,
+  "purge_used_mm3": 200,
+  "purge_remaining_mm3": 200,
+  "solver_message": "材料 ABS 库存不足：需求 280 mm^3，可用 200 mm^3"
+}
+```
+
+#### 超容响应（PURGE_CAPACITY_EXCEEDED）
+
+把 `total_purge_capacity_mm3` 改为 150（顺序 purge 200）：
+
+```json
+{
+  "status": "PURGE_CAPACITY_EXCEEDED",
+  "optimal": false,
+  "objective": null,
+  "allocations": [],
+  "spools": [],
+  "spool_changes": null,
+  "purge_used_mm3": 200,
+  "purge_remaining_mm3": -50,
+  "solver_message": "固定顺序的 purge 总需求 200 mm^3 超过总容量 150 mm^3，未进行料卷分配"
+}
+```
+
+#### 分配请求的 422
+
+以下情况在进入分配前即返回 **422**（与 `/plans` 相同的 Pydantic 错误体）：
+
+- `sequence` **漏段**（未覆盖全部层段）、**重复**、引用**未知作业 / 未知层段**，
+  或作业内层段**未按层序排列（乱序）**；
+- `spools` 中 `spool_id` **重复**、料卷 ID / 材料 ID 为空、余量为负；
+- 缺少 `sequence` / `spools` 字段、出现未声明的额外字段；
+- `/plans` 参数本身非法（作业数、purge 矩阵完整性等，规则同前）。
+
 ### `POST /executions/audit` 执行核验
 
 提交 `/plans` 的全部请求参数，外加一个 `executions` 数组——按**实际执行顺序**
@@ -633,6 +802,11 @@ curl -i -X POST http://localhost:8000/executions/audit \
 时间或 purge 为负、缺少 `executions` 字段同样返回 422（详见上文
 [核验请求的 422](#核验请求的-422)）。
 
+`POST /spools/allocate` 同样继承上述全部规则，此外 `sequence` 漏段 / 重复 /
+引用未知层段 / 作业内乱序、`spools` 中料卷 ID 重复或为空、材料 ID 为空、
+余量为负、缺少 `sequence` / `spools` 字段也返回 422（详见上文
+[分配请求的 422](#分配请求的-422)）。
+
 示例：
 
 ```bash
@@ -652,19 +826,22 @@ curl -i -X POST http://localhost:8000/plans \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 应用：GET /health、POST /plans、POST /executions/audit
+│   ├── main.py        # FastAPI 应用：GET /health、POST /plans、POST /spools/allocate、POST /executions/audit
 │   ├── schemas.py     # 请求/响应模型与 422 输入校验
 │   ├── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
+│   ├── spools.py      # 料卷分配：固定顺序下最小化换卷次数 + 逐段料卷字典序决胜
 │   └── audit.py       # 执行核验：基准构建后按实测时间线逐段回放
 ├── examples/
 │   ├── request.json                     # 可行示例
 │   ├── request_long_job.json            # 长作业示例（单作业 25 段）
 │   ├── request_interleave.json          # 按材料交错示例（两个 25 段 A→B→A 作业，容量 2）
 │   ├── request_infeasible.json          # 容量超限示例
+│   ├── request_spools.json              # 料卷分配示例（选卷与余量）
 │   ├── request_audit_completed.json     # 核验示例：合规完成
 │   └── request_audit_violation.json     # 核验示例：层序错误 + 换料留时/purge 违规
 ├── tests/
 │   ├── test_plans.py            # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
+│   ├── test_spools_allocate.py  # 21 个端到端测试（选卷与余量、4/6 搭配、复用、缺料、超容、422、兼容性等）
 │   └── test_executions_audit.py # 19 个端到端测试（完成/进行中、保留空闲、重叠、层序、换料留时、purge 与超容、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -696,6 +873,14 @@ curl -i -X POST http://localhost:8000/plans \
   明细，状态如实标为 `FEASIBLE`，仅当兜底排列也超容时才返回 `UNKNOWN`。
   三级目标的最优性标记互相独立，只有 CP-SAT 对相应目标（以及字典序决胜
   的每一步可行性）确已证明时才置为 `true`。
+- 料卷分配（`/spools/allocate`）不排产：执行顺序由请求固定，先沿顺序算出
+  每段的段前 purge 与扣减量（打印体积 + purge，均记目标材料料卷），再建
+  选卷模型——每段恰选一卷同材料料卷、每卷累计扣减不超过其余量。求解分
+  两阶段：① CP-SAT 最小化相邻层段料卷 ID 变化次数（相邻段材料不同则
+  换卷不可避免，直接计 1）；② 变化次数锁定为最优值后逐位固定字典序最小
+  的料卷（每位以"最小化该位料卷名次"为目标求解并固定，每步都经最优性
+  证明）。已证无解即 `INSUFFICIENT_STOCK`；限时内未证最优则返回当前
+  可行分配并标 `FEASIBLE`，不声称未证明的最优性。
 
 ## 六、执行核验（/executions/audit）回放规则
 
