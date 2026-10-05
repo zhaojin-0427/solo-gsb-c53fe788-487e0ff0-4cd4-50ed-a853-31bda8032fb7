@@ -1,0 +1,28 @@
+{
+  "jobs": [
+    {
+      "job_id": "J1",
+      "deadline_seconds": 120,
+      "segments": [
+        {"material_id": "PLA", "print_seconds": 60, "volume_mm3": 100},
+        {"material_id": "ABS", "print_seconds": 30, "volume_mm3": 40}
+      ]
+    },
+    {
+      "job_id": "J2",
+      "deadline_seconds": 220,
+      "segments": [
+        {"material_id": "ABS", "print_seconds": 80, "volume_mm3": 120},
+        {"material_id": "PLA", "print_seconds": 20, "volume_mm3": 30}
+      ]
+    }
+  ],
+  "initial_material": "PLA",
+  "purge_matrix": {
+    "PLA": {"PLA": 0, "ABS": 120},
+    "ABS": {"PLA": 80, "ABS": 0}
+  },
+  "switch_seconds": 10,
+  "total_purge_capacity_mm3": 150,
+  "time_limit_seconds": 15
+}

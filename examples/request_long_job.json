@@ -1,0 +1,52 @@
+{
+  "jobs": [
+    {
+      "job_id": "LONG",
+      "deadline_seconds": 100000,
+      "segments": [
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "ABS", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "TPU", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 5}
+      ]
+    },
+    {
+      "job_id": "AUX",
+      "deadline_seconds": 100000,
+      "segments": [
+        {"material_id": "ABS", "print_seconds": 20, "volume_mm3": 7},
+        {"material_id": "PLA", "print_seconds": 20, "volume_mm3": 7}
+      ]
+    }
+  ],
+  "initial_material": "PLA",
+  "purge_matrix": {
+    "PLA": {"PLA": 0, "ABS": 120, "TPU": 90},
+    "ABS": {"PLA": 80, "ABS": 0, "TPU": 100},
+    "TPU": {"PLA": 70, "ABS": 110, "TPU": 0}
+  },
+  "switch_seconds": 5,
+  "total_purge_capacity_mm3": 100000,
+  "time_limit_seconds": 15
+}

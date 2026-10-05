@@ -1,0 +1,74 @@
+{
+  "jobs": [
+    {
+      "job_id": "J1",
+      "deadline_seconds": 100000,
+      "segments": [
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5}
+      ]
+    },
+    {
+      "job_id": "J2",
+      "deadline_seconds": 100000,
+      "segments": [
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "B", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5},
+        {"material_id": "A", "print_seconds": 10, "volume_mm3": 5}
+      ]
+    }
+  ],
+  "initial_material": "A",
+  "purge_matrix": {
+    "A": {"A": 0, "B": 1},
+    "B": {"A": 1, "B": 0}
+  },
+  "switch_seconds": 2,
+  "total_purge_capacity_mm3": 2,
+  "time_limit_seconds": 15
+}
