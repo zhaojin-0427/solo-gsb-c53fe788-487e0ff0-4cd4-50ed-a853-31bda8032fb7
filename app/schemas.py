@@ -292,3 +292,189 @@ class AuditResponse(BaseModel):
     )
     replay: list[ReplayedSegment] = Field(default_factory=list)
     violations: list[ExecutionViolation] = Field(default_factory=list)
+
+
+# ======================== POST /spools/allocate ========================
+
+
+class SpoolIn(BaseModel):
+    """一卷实物料卷：唯一 ID、材料与当前余量。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    spool_id: str = Field(..., min_length=1, description="料卷 ID，请求内全局唯一")
+    material_id: str = Field(..., min_length=1, description="该卷材料 ID")
+    remaining_mm3: int = Field(..., ge=0, description="当前余量（mm^3，非负）")
+
+
+class OrderedSegmentRef(BaseModel):
+    """固定顺序中的一个层段引用：作业 ID + 作业内层序。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(..., min_length=1, description="所属作业 ID")
+    segment_index: int = Field(..., ge=1, description="作业内层段序号，从 1 开始")
+
+
+class AllocateRequest(PlanRequest):
+    """POST /spools/allocate 的请求体：/plans 全部参数 + 料卷库存 + 固定层段顺序。
+
+    层段顺序不由求解器重排，而由调用方以 ``order`` 显式给定：必须**覆盖全部
+    层段且每段恰好一次**，跨作业可交错，但同一作业内的层序必须严格递增
+    （乱序、漏段、重复、引用未知作业 / 未知层段一律 422）。料卷 ID 必须唯一、
+    余量非负；未被任何材料引用的料卷不会被选用，仍在响应中原样列出。
+    """
+
+    spools: list[SpoolIn] = Field(..., min_length=1, description="料卷库存（至少 1 卷）")
+    order: list[OrderedSegmentRef] = Field(
+        ...,
+        description=(
+            "层段的固定执行顺序：覆盖全部层段且每段恰好一次；跨作业可交错，"
+            "同一作业内层序必须严格递增"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_allocate(self) -> "AllocateRequest":
+        # 料卷 ID 唯一
+        spool_ids = [s.spool_id for s in self.spools]
+        if len(set(spool_ids)) != len(spool_ids):
+            raise ValueError("spools 中 spool_id 必须唯一")
+
+        seg_counts = {j.job_id: len(j.segments) for j in self.jobs}
+        expected = {
+            (j.job_id, k)
+            for j in self.jobs
+            for k in range(1, seg_counts[j.job_id] + 1)
+        }
+
+        seen: set = set()
+        last_index: Dict[str, int] = {}
+        for pos, ref in enumerate(self.order, start=1):
+            if ref.job_id not in seg_counts:
+                raise ValueError(f"order 引用了未知作业: {ref.job_id}")
+            if ref.segment_index > seg_counts[ref.job_id]:
+                raise ValueError(
+                    f"order 引用了未知层段: 作业 {ref.job_id} 只有 "
+                    f"{seg_counts[ref.job_id]} 段，却给出第 {ref.segment_index} 段"
+                )
+            key = (ref.job_id, ref.segment_index)
+            if key in seen:
+                raise ValueError(
+                    f"order 中层段重复: 作业 {ref.job_id} 第 {ref.segment_index} 段"
+                )
+            prev = last_index.get(ref.job_id)
+            if prev is not None and ref.segment_index <= prev:
+                raise ValueError(
+                    f"order 中作业 {ref.job_id} 的层序乱序：第 {ref.segment_index} 段"
+                    f"出现在第 {prev} 段之后（作业内必须严格按序）"
+                )
+            last_index[ref.job_id] = ref.segment_index
+            seen.add(key)
+
+        missing = sorted(expected - seen)
+        if missing:
+            preview = ", ".join(f"{j}.{k}" for j, k in missing[:5])
+            more = " …" if len(missing) > 5 else ""
+            raise ValueError(
+                f"order 未覆盖全部层段：期望 {len(expected)} 段、实际 {len(seen)} 段，"
+                f"缺少 {len(missing)} 段（{preview}{more}）"
+            )
+        return self
+
+
+class AllocationItem(BaseModel):
+    """固定顺序中一段的选卷结果与该段对料卷的扣减。"""
+
+    order: int = Field(..., description="在提交顺序中的序号，从 1 开始")
+    job_id: str
+    segment_index: int
+    material_id: str
+    spool_id: str = Field(..., description="该段选用的料卷 ID（每段恰选一卷）")
+    material_switched: bool = Field(
+        ..., description="相对上一段（首段相对初始材料）是否换料"
+    )
+    purge_before_mm3: int = Field(
+        ..., description="沿顺序按 purge_matrix 计算的换料 purge；同材料为 0"
+    )
+    print_volume_mm3: int = Field(..., description="该段名义打印体积（mm^3）")
+    deducted_mm3: int = Field(
+        ..., description="从所选料卷扣除的总量 = purge_before_mm3 + print_volume_mm3"
+    )
+    spool_changed: bool = Field(
+        ...,
+        description=(
+            "所选料卷 ID 是否与紧邻上一段不同（首段为 false）；"
+            "换料处必然换卷，同材料相邻时换卷是优化目标"
+        ),
+    )
+
+
+class SpoolDeduction(BaseModel):
+    """一次从某料卷的扣减（对应一个层段，按提交顺序排列）。"""
+
+    order: int
+    job_id: str
+    segment_index: int
+    material_id: str
+    purge_before_mm3: int
+    print_volume_mm3: int
+    deducted_mm3: int
+    remaining_after_mm3: int = Field(
+        ..., description="本次扣减后该卷余量（mm^3）"
+    )
+
+
+class SpoolBalance(BaseModel):
+    """单卷的扣减汇总与逐段扣减明细。"""
+
+    spool_id: str
+    material_id: str
+    initial_remaining_mm3: int = Field(..., description="请求中声明的初始余量")
+    deducted_mm3: int = Field(..., description="累计扣减（purge + 打印体积）")
+    remaining_mm3: int = Field(..., description="最终余量 = 初始余量 - 累计扣减")
+    deductions: list[SpoolDeduction] = Field(
+        default_factory=list, description="逐段扣减明细（按提交顺序）"
+    )
+
+
+class AllocateResponse(BaseModel):
+    status: str = Field(
+        ...,
+        description=(
+            "ALLOCATED（已完整分配）/ MATERIAL_SHORTAGE（库存不足）/ "
+            "PURGE_CAPACITY_EXCEEDED（固定顺序的 purge 超出总容量）"
+        ),
+    )
+    optimal: bool = Field(
+        ...,
+        description=(
+            "是否已证明分配最优（料卷变化次数最小且逐段料卷 ID 字典序决胜均证明）；"
+            "缺料 / 超容时为 false"
+        ),
+    )
+    allocation: list[AllocationItem] = Field(
+        default_factory=list,
+        description="逐段选卷与扣减（按提交顺序）；缺料 / 超容时为空，不产生任何分配",
+    )
+    spools: list[SpoolBalance] = Field(
+        default_factory=list,
+        description="各卷扣减汇总与余量；缺料 / 超容时累计扣减均为 0",
+    )
+    spool_changes: int = Field(
+        0, description="相邻层段所选料卷 ID 不同的次数（优化目标）"
+    )
+    purge_used_mm3: int = Field(
+        0, description="沿固定顺序累计的换料 purge（mm^3）"
+    )
+    purge_remaining_mm3: int = Field(
+        0, description="purge 总容量 - 已用 purge"
+    )
+    reason: Optional[dict] = Field(
+        None,
+        description=(
+            "非 ALLOCATED 时的原因：MATERIAL_SHORTAGE 带各材料缺料明细，"
+            "PURGE_CAPACITY_EXCEEDED 带所需 purge 与总容量"
+        ),
+    )
+    solver_message: str = ""

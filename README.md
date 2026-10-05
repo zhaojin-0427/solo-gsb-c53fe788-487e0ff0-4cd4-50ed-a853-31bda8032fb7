@@ -26,6 +26,14 @@
 基准后**逐段按实测时间线回放**——保留空闲与实际耗时，不按紧密排产重算——返回
 进行中 / 完成 / 违规状态、已用与剩余 purge、完工作业逾期与违规位置。
 
+服务还提供 **`POST /spools/allocate`（固定顺序料卷分配）**：提交 `/plans`
+相同的规划参数、一卷卷实物料卷（唯一料卷 ID、材料、非负余量）与一个**调用方
+给定的固定层段顺序**（`(作业 ID, 层序)` 序列，覆盖全部层段、作业内严格按序）。
+服务经现有校验与 `build_instance` 取每段材料与名义体积，沿顺序从初始材料计算
+换料 purge；每段的**换料 purge 与打印体积都从该段目标材料所选料卷扣除**
+（每段恰选一卷），卸下的料卷重新进入库存池、可被后续层段复用。分配先最小化
+**相邻层段料卷 ID 变化次数**，再按逐段料卷 ID 的字典序决胜。
+
 ---
 
 ## 一、Docker Compose 一键启动
@@ -618,6 +626,227 @@ curl -i -X POST http://localhost:8000/executions/audit \
 # ... "msg": "executions 引用了未知层段: 作业 J1 只有 1 段，却给出第 9 段" ...
 ```
 
+### `POST /spools/allocate` 固定顺序料卷分配
+
+提交 `/plans` 的全部请求参数，外加 **`spools`（料卷库存）** 与 **`order`
+（固定层段顺序）**。与 `/plans` 不同，层段顺序**不由求解器重排**：`order`
+是调用方给定的 `(作业 ID, 层序)` 序列，跨作业可以交错，但必须**覆盖全部
+层段且每段恰好一次、同一作业内层序严格递增**。服务：
+
+1. 经现有 `PlanRequest` 校验并用 `build_instance` 取每段的材料与名义打印
+   体积（`volume_mm3`）；
+2. 沿固定顺序从 `initial_material` 计算每段的换料 purge
+   （`purge_matrix[上一段材料][本段材料]`，同材料相邻为 0；首段相对初始材料）；
+3. 为每个层段恰选**一卷目标材料的料卷**，该段的**换料 purge 与打印体积
+   都从这卷扣除**（扣减 = `purge_before_mm3 + print_volume_mm3`）；料卷卸下
+   后重新进入库存池，可被后续任意不相邻层段复用（只受累计扣减不超过余量约束）。
+
+优化目标按严格优先级：
+
+1. **相邻层段料卷 ID 变化次数最小**——换料处料卷必然变化（不可优化），
+   只有同材料相邻段可能沿用同一卷；尽量延续同卷即最小化换卷次数；
+2. 变化次数相同时，逐段所选料卷 ID 元组的**字典序最小**（按顺序位置逐位
+   比较，料卷 ID 字符串升序）。
+
+三种 200 状态：
+
+| `status` | 含义 |
+| --- | --- |
+| `ALLOCATED` | 找到覆盖全部层段的完整分配；`optimal` 表示两级目标是否均已证明最优 |
+| `MATERIAL_SHORTAGE` | 某材料全部料卷余量之和不足以覆盖该材料的累计需求（含换料 purge 与打印体积），或单卷容量碎片化导致逐段整卷扣减无法装下；**不产生任何分配**，`reason.deficits` 给出各材料缺料量 |
+| `PURGE_CAPACITY_EXCEEDED` | 沿固定顺序的 purge 之和已超过 `total_purge_capacity_mm3`（顺序固定无法重排）；**不产生任何分配**，`reason` 给出所需 purge 与容量 |
+
+缺料 / 超容时 `allocation` 为空、各卷累计扣减为 0（库存原样列出）。
+
+请求字段（仅列新增部分，其余字段与 `/plans` 完全一致）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `spools` | 非空数组 | 料卷库存 |
+| `spools[].spool_id` | 非空字符串 | 料卷 ID，请求内唯一 |
+| `spools[].material_id` | 非空字符串 | 该卷材料；未被任何层段使用的料卷不会被扣减，仍在响应中原样列出 |
+| `spools[].remaining_mm3` | 非负整数 | 料卷当前余量（mm³） |
+| `order` | 数组 | 固定层段顺序：覆盖全部层段且每段恰好一次，跨作业可交错、作业内严格按序 |
+| `order[].job_id` | 非空字符串 | 作业 ID，必须在 `jobs` 中存在 |
+| `order[].segment_index` | 正整数 | 作业内层段序号，必须在该作业层段范围内 |
+
+请求示例（文件见 `examples/request_spools_allocate.json`）：
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "J1",
+      "deadline_seconds": 120,
+      "segments": [
+        {"material_id": "PLA", "print_seconds": 60, "volume_mm3": 100},
+        {"material_id": "ABS", "print_seconds": 30, "volume_mm3": 40}
+      ]
+    },
+    {
+      "job_id": "J2",
+      "deadline_seconds": 220,
+      "segments": [
+        {"material_id": "ABS", "print_seconds": 80, "volume_mm3": 120},
+        {"material_id": "PLA", "print_seconds": 20, "volume_mm3": 30}
+      ]
+    }
+  ],
+  "initial_material": "PLA",
+  "purge_matrix": {
+    "PLA": {"PLA": 0, "ABS": 120},
+    "ABS": {"PLA": 80, "ABS": 0}
+  },
+  "switch_seconds": 10,
+  "total_purge_capacity_mm3": 400,
+  "spools": [
+    {"spool_id": "PLA-A", "material_id": "PLA", "remaining_mm3": 100},
+    {"spool_id": "PLA-B", "material_id": "PLA", "remaining_mm3": 110},
+    {"spool_id": "ABS-A", "material_id": "ABS", "remaining_mm3": 160},
+    {"spool_id": "ABS-B", "material_id": "ABS", "remaining_mm3": 200}
+  ],
+  "order": [
+    {"job_id": "J1", "segment_index": 1},
+    {"job_id": "J1", "segment_index": 2},
+    {"job_id": "J2", "segment_index": 1},
+    {"job_id": "J2", "segment_index": 2}
+  ]
+}
+```
+
+调用：
+
+```bash
+curl -X POST http://localhost:8000/spools/allocate \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_spools_allocate.json
+```
+
+**实际响应**（与服务输出一致）：
+
+```json
+{
+  "status": "ALLOCATED",
+  "optimal": true,
+  "allocation": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "spool_id": "PLA-A", "material_switched": false,
+     "purge_before_mm3": 0, "print_volume_mm3": 100,
+     "deducted_mm3": 100, "spool_changed": false},
+    {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "ABS",
+     "spool_id": "ABS-A", "material_switched": true,
+     "purge_before_mm3": 120, "print_volume_mm3": 40,
+     "deducted_mm3": 160, "spool_changed": true},
+    {"order": 3, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+     "spool_id": "ABS-B", "material_switched": false,
+     "purge_before_mm3": 0, "print_volume_mm3": 120,
+     "deducted_mm3": 120, "spool_changed": true},
+    {"order": 4, "job_id": "J2", "segment_index": 2, "material_id": "PLA",
+     "spool_id": "PLA-B", "material_switched": true,
+     "purge_before_mm3": 80, "print_volume_mm3": 30,
+     "deducted_mm3": 110, "spool_changed": true}
+  ],
+  "spools": [
+    {"spool_id": "ABS-A", "material_id": "ABS",
+     "initial_remaining_mm3": 160, "deducted_mm3": 160, "remaining_mm3": 0,
+     "deductions": [
+       {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "ABS",
+        "purge_before_mm3": 120, "print_volume_mm3": 40,
+        "deducted_mm3": 160, "remaining_after_mm3": 0}]},
+    {"spool_id": "ABS-B", "material_id": "ABS",
+     "initial_remaining_mm3": 200, "deducted_mm3": 120, "remaining_mm3": 80,
+     "deductions": [
+       {"order": 3, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+        "purge_before_mm3": 0, "print_volume_mm3": 120,
+        "deducted_mm3": 120, "remaining_after_mm3": 80}]},
+    {"spool_id": "PLA-A", "material_id": "PLA",
+     "initial_remaining_mm3": 100, "deducted_mm3": 100, "remaining_mm3": 0,
+     "deductions": [
+       {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+        "purge_before_mm3": 0, "print_volume_mm3": 100,
+        "deducted_mm3": 100, "remaining_after_mm3": 0}]},
+    {"spool_id": "PLA-B", "material_id": "PLA",
+     "initial_remaining_mm3": 110, "deducted_mm3": 110, "remaining_mm3": 0,
+     "deductions": [
+       {"order": 4, "job_id": "J2", "segment_index": 2, "material_id": "PLA",
+        "purge_before_mm3": 80, "print_volume_mm3": 30,
+        "deducted_mm3": 110, "remaining_after_mm3": 0}]}
+  ],
+  "spool_changes": 3,
+  "purge_used_mm3": 200,
+  "purge_remaining_mm3": 200,
+  "reason": null,
+  "solver_message": "ABS: 已证明料卷变化次数最小且逐段料卷 ID 字典序最小；PLA: 已证明料卷变化次数最小且逐段料卷 ID 字典序最小"
+}
+```
+
+结果解读（以选卷与余量为例）：
+
+- **第 1 段**（J1.1，PLA，打印 100）与初始材料相同、无 purge：选 `PLA-A`
+  扣 100，余量 100 → **0**；
+- **第 2 段**（J1.2，ABS）发生 PLA→ABS 换料：purge 120 **连同**打印体积 40
+  一起从目标材料卷 `ABS-A` 扣 160，余量 160 → **0**；
+- **第 3 段**（J2.1，ABS）与上一段同材料、无 purge，但 `ABS-A` 已用尽，
+  必须换上 `ABS-B` 扣 120，余量 200 → **80**；
+- **第 4 段**（J2.2，PLA）发生 ABS→PLA 换料：purge 80 + 打印 30 = 110
+  从 `PLA-B` 扣除，余量 110 → **0**。
+
+相邻层段料卷 ID 共变化 3 次（PLA-A→ABS-A→ABS-B→PLA-B），其中两次是换料
+必然换卷，一次（ABS-A→ABS-B）由余量约束导致；purge 共 200 mm³，容量余 200。
+`allocation[]` 给出逐段选卷与扣减，`spools[].deductions[]` 给出每卷的逐次
+扣减与扣后余量。卸下的卷可复用：若某卷先用于第 1 段、中间打印别的材料，
+第 4 段仍可装回同一卷而不需要新卷，求解器会优先沿用同卷以最小化换卷次数。
+
+一个边界保证：同材料连续两段依次需要 4、6 mm³ 时，余量**恰为 4 与 6** 的
+两卷必须能分配——第一段用余量 4 的卷（扣 4）、第二段换余量 6 的卷（扣 6），
+不会因"总余量恰为总需求却无法共用一卷"而误报缺料。
+
+#### 缺料与超容响应
+
+库存不足（同材料全部料卷余量之和 < 该材料 purge + 打印累计需求）时返回
+`MATERIAL_SHORTAGE`，`allocation` 为空、各卷不扣减：
+
+```json
+{
+  "status": "MATERIAL_SHORTAGE",
+  "optimal": false,
+  "allocation": [],
+  "spools": [
+    {"spool_id": "A1", "material_id": "A",
+     "initial_remaining_mm3": 5, "deducted_mm3": 0, "remaining_mm3": 5,
+     "deductions": []},
+    {"spool_id": "B1", "material_id": "B",
+     "initial_remaining_mm3": 100, "deducted_mm3": 0, "remaining_mm3": 100,
+     "deductions": []}
+  ],
+  "spool_changes": 0,
+  "purge_used_mm3": 0,
+  "purge_remaining_mm3": 1000000,
+  "reason": {
+    "code": "MATERIAL_SHORTAGE",
+    "message": "材料 A 缺 15 mm^3：同材料全部料卷余量之和不足以覆盖该材料的打印体积与换料 purge 总需求；未产生任何分配",
+    "deficits": [
+      {"material_id": "A", "required_mm3": 20, "available_mm3": 5,
+       "shortage_mm3": 15}
+    ]
+  },
+  "solver_message": "库存不足，未进行料卷分配"
+}
+```
+
+固定顺序的 purge 累计超出容量时返回 `PURGE_CAPACITY_EXCEEDED`（顺序固定、
+不重排），`reason.purge_required_mm3` / `reason.capacity_mm3` 给出所需 purge
+与容量，`purge_remaining_mm3` 为负值；该状态优先于缺料判定。
+
+#### 料卷分配请求的 422
+
+除继承 `/plans` 的全部 422 规则外，以下情况在进入分配前即返回 **422**：
+
+- `order` **漏段**（未覆盖全部层段）、**层段重复**、引用**未知作业 / 未知层段**；
+- 同一作业的层序在 `order` 中**乱序**（如第 2 段排在第 1 段前；跨作业交错合法）；
+- `spools` 为空或缺失、料卷 ID **重复或为空**、余量为负、出现未声明字段；
+- `order` 缺失或为空（空数组必然无法覆盖全部层段）。
+
 ### 非法数据（HTTP 422）
 
 以下情况返回 **422 Unprocessable Entity**（FastAPI/Pydantic 标准错误体，含字段定位）：
@@ -632,6 +861,11 @@ curl -i -X POST http://localhost:8000/executions/audit \
 作业 / 未知层段、层段重复、`end_seconds < start_seconds`（起止倒置）、
 时间或 purge 为负、缺少 `executions` 字段同样返回 422（详见上文
 [核验请求的 422](#核验请求的-422)）。
+
+`POST /spools/allocate` 同样继承上述全部规则，此外 `order` 漏段 / 层段重复 /
+引用未知作业或层段 / 作业内层序乱序，以及 `spools` 料卷 ID 重复或为空、
+余量为负、缺少 `spools` 或 `order` 字段也返回 422（详见上文
+[料卷分配请求的 422](#料卷分配请求的-422)）。
 
 示例：
 
@@ -652,20 +886,23 @@ curl -i -X POST http://localhost:8000/plans \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 应用：GET /health、POST /plans、POST /executions/audit
+│   ├── main.py        # FastAPI 应用：GET /health、POST /plans、POST /executions/audit、POST /spools/allocate
 │   ├── schemas.py     # 请求/响应模型与 422 输入校验
 │   ├── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
-│   └── audit.py       # 执行核验：基准构建后按实测时间线逐段回放
+│   ├── audit.py       # 执行核验：基准构建后按实测时间线逐段回放
+│   └── allocation.py  # 固定顺序料卷分配：逐段 purge/打印扣卷、换卷次数最小 + 料卷 ID 字典序决胜
 ├── examples/
 │   ├── request.json                     # 可行示例
 │   ├── request_long_job.json            # 长作业示例（单作业 25 段）
 │   ├── request_interleave.json          # 按材料交错示例（两个 25 段 A→B→A 作业，容量 2）
 │   ├── request_infeasible.json          # 容量超限示例
 │   ├── request_audit_completed.json     # 核验示例：合规完成
-│   └── request_audit_violation.json     # 核验示例：层序错误 + 换料留时/purge 违规
+│   ├── request_audit_violation.json     # 核验示例：层序错误 + 换料留时/purge 违规
+│   └── request_spools_allocate.json     # 料卷分配示例：固定顺序 + 料卷库存
 ├── tests/
 │   ├── test_plans.py            # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
-│   └── test_executions_audit.py # 19 个端到端测试（完成/进行中、保留空闲、重叠、层序、换料留时、purge 与超容、422 等）
+│   ├── test_executions_audit.py # 19 个端到端测试（完成/进行中、保留空闲、重叠、层序、换料留时、purge 与超容、422 等）
+│   └── test_spools_allocate.py  # 16 个端到端测试（选卷扣减、复用、变化次数优先、字典序决胜、4/6 边界、缺料/超容、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -722,3 +959,24 @@ curl -i -X POST http://localhost:8000/plans \
 存在任何违规即 `VIOLATED`（哪怕层段已全部提交）；无违规时按是否全部
 提交区分 `COMPLETED` / `IN_PROGRESS`。未知或重复层段、起止倒置等请求
 格式问题在 Pydantic 层拦截为 HTTP 422，不进入回放。
+
+## 七、固定顺序料卷分配（/spools/allocate）
+
+料卷分配**不重排层段**：`order` 由调用方给定并经 schema 校验（覆盖全部
+层段、每段一次、作业内严格按序）。模块经 `build_instance` 取材料与名义
+体积后沿顺序计算 purge，并在两个硬前置条件上快速失败：
+
+1. 沿顺序的 purge 之和超过总容量 → `PURGE_CAPACITY_EXCEEDED`（顺序固定，
+   无法像 `/plans` 那样靠交错省 purge）；
+2. 某材料全部料卷余量之和小于该材料的累计需求（换料 purge 与打印体积都
+   按换入材料计入）→ `MATERIAL_SHORTAGE`。
+
+两者都不满足时才进入 CP-SAT 分配。换料边界处料卷必然变化、不构成选择，
+故模型按材料拆分、各材料独立求解：布尔变量 `x[t,s]` 表示该材料第 t 段
+选用卷 s（每段恰一卷），`load[s] = Σ demand_t·x[t,s] ≤ 该卷余量`——
+卸下即复用，跨 run 使用同一卷只增加累计负载、不产生额外约束。目标为
+同材料相邻段选卷不同的次数（布尔蕴含刻画"两段同选一卷"），先最小化该
+次数；再逐位贪心固定料卷 ID（每步一次锁定最优次数的 CP-SAT 可行性
+证明）得到逐段料卷 ID 字典序最小解。任一步限时内无法判定，则返回当前
+可行选卷并把 `optimal` 置为 `false`；总量充足但单卷碎片化导致 CP 不可行
+时如实报 `MATERIAL_SHORTAGE`，缺料 / 超容均不产生任何部分分配。
